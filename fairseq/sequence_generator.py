@@ -6,6 +6,7 @@
 # can be found in the PATENTS file in the same directory.
 
 import math
+import os
 
 import torch
 
@@ -78,22 +79,34 @@ class SequenceGenerator(object):
             if 'net_input' not in s:
                 continue
             input = s['net_input']
-            # model.forward normally channels prev_output_tokens into the decoder
-            # separately, but SequenceGenerator directly calls model.encoder
-            encoder_input = {
-                k: v for k, v in input.items()
-                if k != 'prev_output_tokens'
-            }
-            srclen = encoder_input['src_tokens'].size(1)
+            srclen = input['src_tokens'].size(1)
             if timer is not None:
                 timer.start()
             with torch.no_grad():
-                hypos = self.generate(
-                    encoder_input,
-                    beam_size=beam_size,
-                    maxlen=int(maxlen_a*srclen + maxlen_b),
-                    prefix_tokens=s['target'][:, :prefix_size] if prefix_size > 0 else None,
-                )
+                #from IPython.core.debugger import Pdb; Pdb().set_trace()
+                context_flag = True
+                #if input.get('context_tokens', None) is None or \
+                #   os.environ.get('FSEQ_USE_CONTEXT_EMBEDDING', '0') == '0':
+                if input.get('context_tokens', None) is None:
+                    context_flag = False
+                if context_flag:
+                    hypos = self.generate(
+                        input['src_tokens'],
+                        input['src_lengths'],
+                        beam_size=beam_size,
+                        maxlen=int(maxlen_a*srclen + maxlen_b),
+                        prefix_tokens=s['target'][:, :prefix_size] if prefix_size > 0 else None,
+                        context_tokens=input['context_tokens'],
+                        context_lengths=input['context_lengths'],
+                    )
+                else:
+                    hypos = self.generate(
+                        input['src_tokens'],
+                        input['src_lengths'],
+                        beam_size=beam_size,
+                        maxlen=int(maxlen_a*srclen + maxlen_b),
+                        prefix_tokens=s['target'][:, :prefix_size] if prefix_size > 0 else None,
+                    )
             if timer is not None:
                 timer.stop(sum(len(h[0]['tokens']) for h in hypos))
             for i, id in enumerate(s['id'].data):
@@ -102,23 +115,16 @@ class SequenceGenerator(object):
                 ref = utils.strip_pad(s['target'].data[i, :], self.pad) if s['target'] is not None else None
                 yield id, src, ref, hypos[i]
 
-    def generate(self, encoder_input, beam_size=None, maxlen=None, prefix_tokens=None):
-        """Generate a batch of translations.
-
-        Args:
-            encoder_input: dictionary containing the inputs to
-                model.encoder.forward
-            beam_size: int overriding the beam size. defaults to
-                self.beam_size
-            max_len: maximum length of the generated sequence
-            prefix_tokens: force decoder to begin with these tokens
-        """
+    def generate(self, src_tokens, src_lengths, beam_size=None, maxlen=None, prefix_tokens=None, context_tokens=None, context_lengths=None):
+        """Generate a batch of translations."""
         with torch.no_grad():
-            return self._generate(encoder_input, beam_size, maxlen, prefix_tokens)
+            return self._generate(src_tokens, src_lengths, beam_size, maxlen, prefix_tokens, context_tokens, context_lengths)
 
-    def _generate(self, encoder_input, beam_size=None, maxlen=None, prefix_tokens=None):
-        """See generate"""
-        src_tokens = encoder_input['src_tokens']
+    def _generate(self, src_tokens, src_lengths, beam_size=None, maxlen=None, prefix_tokens=None, context_tokens=None, context_lengths=None):
+        context_flag = False
+        if context_tokens is not None and context_lengths is not None:
+            context_flag = True
+
         bsz, srclen = src_tokens.size()
         maxlen = min(maxlen, self.maxlen) if maxlen is not None else self.maxlen
 
@@ -137,10 +143,19 @@ class SequenceGenerator(object):
                 incremental_states[model] = None
 
             # compute the encoder output for each beam
-            encoder_out = model.encoder(**encoder_input)
-            new_order = torch.arange(bsz).view(-1, 1).repeat(1, beam_size).view(-1)
-            new_order = new_order.to(src_tokens.device)
-            encoder_out = model.encoder.reorder_encoder_out(encoder_out, new_order)
+            #from IPython.core.debugger import Pdb; Pdb().set_trace()
+            if context_flag:
+                encoder_out = model.encoder(
+                    src_tokens.repeat(1, beam_size).view(-1, srclen),
+                    src_lengths.expand(beam_size, src_lengths.numel()).t().contiguous().view(-1),
+                    context_tokens=context_tokens.repeat(1, beam_size).view(-1, context_tokens.size()[1]),
+                    context_lengths=context_lengths.expand(beam_size, context_lengths.numel()).t().contiguous().view(-1),
+                )
+            else:
+                encoder_out = model.encoder(
+                    src_tokens.repeat(1, beam_size).view(-1, srclen),
+                    src_lengths.expand(beam_size, src_lengths.numel()).t().contiguous().view(-1),
+                )
             encoder_outs.append(encoder_out)
 
         # initialize buffers
@@ -507,11 +522,7 @@ class SequenceGenerator(object):
                 decoder_out = list(model.decoder(tokens, encoder_out))
             decoder_out[0] = decoder_out[0][:, -1, :]
             attn = decoder_out[1]
-            if type(attn) is dict:
-                attn = attn['attn']
             if attn is not None:
-                if type(attn) is dict:
-                    attn = attn['attn']
                 attn = attn[:, -1, :]
         probs = model.get_normalized_probs(decoder_out, log_probs=log_probs)
         return probs, attn

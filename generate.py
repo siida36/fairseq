@@ -57,6 +57,7 @@ def main(args):
     align_dict = utils.load_align_dict(args.replace_unk)
 
     # Load dataset (possibly sharded)
+    #from IPython.core.debugger import Pdb; Pdb().set_trace()
     itr = task.get_batch_iterator(
         dataset=task.dataset(args.gen_subset),
         max_tokens=args.max_tokens,
@@ -88,6 +89,7 @@ def main(args):
         translator.cuda()
 
     # Generate and compute BLEU score
+    #from IPython.core.debugger import Pdb; Pdb().set_trace()
     scorer = bleu.Scorer(tgt_dict.pad(), tgt_dict.eos(), tgt_dict.unk())
     num_sentences = 0
     has_target = True

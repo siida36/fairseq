@@ -34,6 +34,19 @@ def collate(
     id = id.index_select(0, sort_order)
     src_tokens = src_tokens.index_select(0, sort_order)
 
+    context_flag = False
+    context_tokens = None
+    context_lengths = None
+    if 'context' in samples[0].keys():
+        #from IPython.core.debugger import Pdb; Pdb().set_trace()
+        try:
+            id = torch.LongTensor([s['id'] for s in samples])
+            context_tokens = merge('context', left_pad=left_pad_source)
+            context_lengths = torch.LongTensor([s['context'].numel() for s in samples])
+            context_flag = True
+        except:
+            context_flag = False
+
     prev_output_tokens = None
     target = None
     if samples[0].get('target', None) is not None:
@@ -53,16 +66,43 @@ def collate(
     else:
         ntokens = sum(len(s['source']) for s in samples)
 
-    batch = {
-        'id': id,
-        'ntokens': ntokens,
-        'net_input': {
-            'src_tokens': src_tokens,
-            'src_lengths': src_lengths,
-        },
-        'target': target,
-        'nsentences': samples[0]['source'].size(0),
-    }
+    if context_flag:
+        batch = {
+            'id': id,
+            'ntokens': ntokens,
+            'net_input': {
+                'src_tokens': src_tokens,
+                'src_lengths': src_lengths,
+                'context_tokens': context_tokens,
+                'context_lengths': context_lengths,
+            },
+            'target': target,
+        }
+        """
+        batch = {
+            'id': id,
+            'ntokens': ntokens,
+            'net_input': {
+                'src_tokens': src_tokens,
+                'src_lengths': src_lengths,
+            },
+            'net_context': {
+                'context_tokens': context_tokens,
+                'context_lengths': context_lengths,
+            },
+            'target': target,
+        }
+        """
+    else:
+        batch = {
+            'id': id,
+            'ntokens': ntokens,
+            'net_input': {
+                'src_tokens': src_tokens,
+                'src_lengths': src_lengths,
+            },
+            'target': target,
+        }
     if prev_output_tokens is not None:
         batch['net_input']['prev_output_tokens'] = prev_output_tokens
     return batch
@@ -119,9 +159,11 @@ class LanguagePairDataset(FairseqDataset):
         self.input_feeding = input_feeding
 
     def __getitem__(self, index):
+        #from IPython.core.debugger import Pdb; Pdb().set_trace()
         return {
             'id': index,
             'source': self.src[index],
+            'context': self.src[index - 1],
             'target': self.tgt[index] if self.tgt is not None else None,
         }
 
@@ -193,6 +235,8 @@ class LanguagePairDataset(FairseqDataset):
     def ordered_indices(self):
         """Return an ordered list of indices. Batches will be constructed based
         on this order."""
+        #from IPython.core.debugger import Pdb; Pdb().set_trace()
+        self.shuffle = False
         if self.shuffle:
             indices = np.random.permutation(len(self))
         else:

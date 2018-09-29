@@ -6,6 +6,7 @@
 # can be found in the PATENTS file in the same directory.
 
 import math
+import os
 
 import torch
 import torch.nn as nn
@@ -213,7 +214,7 @@ class TransformerLanguageModel(FairseqLanguageModel):
         else:
             embed_tokens = Embedding(len(task.dictionary), args.decoder_input_dim, task.dictionary.pad())
 
-        decoder = TransformerDecoder(args, task.output_dictionary, embed_tokens, no_encoder_attn=True, final_norm=False)
+        decoder = TransformerDecoder(args, task.dictionary, embed_tokens, no_encoder_attn=True, final_norm=False)
         return TransformerLanguageModel(decoder)
 
 
@@ -256,7 +257,12 @@ class TransformerEncoder(FairseqEncoder):
         if self.normalize:
            self.layer_norm = LayerNorm(embed_dim)
 
-    def forward(self, src_tokens, src_lengths):
+        self.max_lengths = 256#128
+        self.pseudo_word = 1
+        self.linear_context = nn.Linear(self.max_lengths, self.pseudo_word)
+
+    def forward(self, src_tokens, src_lengths,
+                context_tokens=None, context_lengths=None):
         """
         Args:
             src_tokens (LongTensor): tokens in the source language of shape
@@ -271,26 +277,217 @@ class TransformerEncoder(FairseqEncoder):
                 - **encoder_padding_mask** (ByteTensor): the positions of
                   padding elements of shape `(batch, src_len)`
         """
-        # embed tokens and positions
-        x = self.embed_scale * self.embed_tokens(src_tokens)
-        if self.embed_positions is not None:
-            x += self.embed_positions(src_tokens)
-        x = F.dropout(x, p=self.dropout, training=self.training)
+        def traditional():
+            # embed tokens and positions
+            x = self.embed_scale * self.embed_tokens(src_tokens)
+            if self.embed_positions is not None:
+                x += self.embed_positions(src_tokens)
+            x = F.dropout(x, p=self.dropout, training=self.training)
 
-        # B x T x C -> T x B x C
-        x = x.transpose(0, 1)
+            # B x T x C -> T x B x C
+            x = x.transpose(0, 1)
 
-        # compute padding mask
-        encoder_padding_mask = src_tokens.eq(self.padding_idx)
-        if not encoder_padding_mask.any():
-            encoder_padding_mask = None
+            # compute padding mask
+            encoder_padding_mask = src_tokens.eq(self.padding_idx)
+            if not encoder_padding_mask.any():
+                encoder_padding_mask = None
 
-        # encoder layers
-        for layer in self.layers:
-            x = layer(x, encoder_padding_mask)
+            # encoder layers
+            for layer in self.layers:
+                x = layer(x, encoder_padding_mask)
 
-        if self.normalize:
-            x = self.layer_norm(x)
+            if self.normalize:
+                x = self.layer_norm(x)
+
+            return x, encoder_padding_mask
+
+        def context_embedding(mode='linear'):
+            # for context
+            # embed tokens and positions
+            c = self.embed_scale * self.embed_tokens(context_tokens)
+            if self.embed_positions is not None:
+                c += self.embed_positions(context_tokens)
+            c = F.dropout(c, p=self.dropout, training=self.training)
+
+            # B x T x C -> T x B x C
+            c = c.transpose(0, 1)
+
+            # compute padding mask
+            encoder_padding_mask_c = context_tokens.eq(self.padding_idx)
+            if not encoder_padding_mask_c.any():
+                encoder_padding_mask_c = None
+
+            # encoder layers
+            encode_context_flag = True
+            #encode_context_flag = False
+            if mode == 'source_target':
+                encode_context_flag = False
+            if encode_context_flag:
+                for layer in self.layers:
+                    c = layer(c, encoder_padding_mask_c)
+                if self.normalize:
+                    c = self.layer_norm(c)
+            else:
+                #self.pseudo_word = context_tokens.shape
+                #raise NotImplementedError
+                pass
+
+            # for source
+            # embed tokens and positions
+            x = self.embed_scale * self.embed_tokens(src_tokens)
+            if self.embed_positions is not None:
+                x += self.embed_positions(src_tokens)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+
+            # B x T x C -> T x B x C
+            x = x.transpose(0, 1)
+
+            # (optional)
+            cpu_flag = False
+            if os.environ.get('FSEQ_CPU', '') == '1':
+                cpu_flag = True
+            if mode == 'source_target':
+                if not cpu_flag:
+                    pad = torch.zeros([abs(x.shape[0] - c.shape[0]), 
+                                       c.shape[1], c.shape[2]]).cuda()
+                else:
+                    raise NotImplementedError
+                    pad = torch.zeros([self.max_lengths - c.shape[0], 
+                                       c.shape[1], c.shape[2]])
+                x_pad = torch.cat([x, pad])
+                for layer in self.layers:
+                    c = layer.source_target_forward(c, encoder_padding_mask_c, x_pad)
+                if self.normalize:
+                    c = self.layer_norm(c)
+
+            # compute padding mask
+            encoder_padding_mask = src_tokens.eq(self.padding_idx)
+            #encoder_padding_mask = torch.cat([encoder_padding_mask, torch.zeros(encoder_padding_mask.shape[0], dtype=torch.uint8).view(encoder_padding_mask.shape[0],-1).cuda()],1)
+            #from IPython.core.debugger import Pdb; Pdb().set_trace()
+            cpu_flag = True
+            cpu_flag = False
+            if os.environ.get('FSEQ_CPU', '') == '1':
+                cpu_flag = True
+            if not cpu_flag:
+                encoder_padding_mask = torch.cat([encoder_padding_mask, 
+                                                  torch.zeros([encoder_padding_mask.shape[0], self.pseudo_word], dtype=torch.uint8).cuda()], 1)
+            else:
+                encoder_padding_mask = torch.cat([encoder_padding_mask, 
+                                                  torch.zeros([encoder_padding_mask.shape[0], self.pseudo_word], dtype=torch.uint8)], 1)
+            if not encoder_padding_mask.any():
+                encoder_padding_mask = None
+
+            # encoder layers
+            if mode == 'sum':
+                x = torch.cat([x,torch.sum(c, 0).view(1,-1,c.shape[-1])], 0)
+            elif mode == 'mean':
+                x = torch.cat([x,torch.mean(c, 0).view(1,-1,c.shape[-1])], 0)
+            elif mode == 'linear' or mode == 'source_target':
+                if not cpu_flag:
+                    pad = torch.zeros([self.max_lengths - c.shape[0], 
+                                       c.shape[1], c.shape[2]]).cuda()
+                else:
+                    pad = torch.zeros([self.max_lengths - c.shape[0], 
+                                       c.shape[1], c.shape[2]])
+                c_pad = torch.cat([c, pad])
+                #c_ = self.linear_context(c_pad.transpose(0,2)).transpose(0,2)
+                c_ = torch.tanh(self.linear_context(c_pad.transpose(0,2)).transpose(0,2))
+                x = torch.cat([x, c_], 0)
+            else:
+                raise NotImplementedError
+
+            for layer in self.layers:
+                x = layer(x, encoder_padding_mask)
+
+            if self.normalize:
+                x = self.layer_norm(x)
+
+            return x, encoder_padding_mask
+
+        def multi_encoder(mode='voita'):
+            # TODO: layer内部のself_attnを引っ張り出し、voitaの最上位を作る
+            raise NotImplementedError
+            # for context
+            # embed tokens and positions
+            c = self.embed_scale * self.embed_tokens(context_tokens)
+            if self.embed_positions is not None:
+                c += self.embed_positions(context_tokens)
+            c = F.dropout(c, p=self.dropout, training=self.training)
+
+            # B x T x C -> T x B x C
+            c = c.transpose(0, 1)
+
+            # compute padding mask
+            encoder_padding_mask_c = context_tokens.eq(self.padding_idx)
+            if not encoder_padding_mask_c.any():
+                encoder_padding_mask_c = None
+
+            # encoder layers
+            for layer in self.layers:
+                c = layer(c, encoder_padding_mask_c)
+            if self.normalize:
+                c = self.layer_norm(c)
+
+            # for source
+            # embed tokens and positions
+            x = self.embed_scale * self.embed_tokens(src_tokens)
+            if self.embed_positions is not None:
+                x += self.embed_positions(src_tokens)
+            x = F.dropout(x, p=self.dropout, training=self.training)
+
+            # B x T x C -> T x B x C
+            x = x.transpose(0, 1)
+
+            # compute padding mask
+            encoder_padding_mask = src_tokens.eq(self.padding_idx)
+            cpu_flag = True
+            cpu_flag = False
+            if os.environ.get('FSEQ_CPU', '') == '1':
+                cpu_flag = True
+            if not cpu_flag:
+                encoder_padding_mask = torch.cat([encoder_padding_mask, 
+                                                  torch.zeros([encoder_padding_mask.shape[0], self.pseudo_word], dtype=torch.uint8).cuda()], 1)
+            else:
+                encoder_padding_mask = torch.cat([encoder_padding_mask, 
+                                                  torch.zeros([encoder_padding_mask.shape[0], self.pseudo_word], dtype=torch.uint8)], 1)
+            if not encoder_padding_mask.any():
+                encoder_padding_mask = None
+
+            # encoder layers
+            if mode == 'voita':
+                if not cpu_flag:
+                    pad = torch.zeros([self.max_lengths - c.shape[0], 
+                                       c.shape[1], c.shape[2]]).cuda()
+                else:
+                    pad = torch.zeros([self.max_lengths - c.shape[0], 
+                                       c.shape[1], c.shape[2]])
+                c_pad = torch.cat([c, pad])
+                c_ = torch.tanh(self.linear_context(c_pad.transpose(0,2)).transpose(0,2))
+                x = torch.cat([x, c_], 0)
+            else:
+                raise NotImplementedError
+
+            for layer in self.layers:
+                x = layer(x, encoder_padding_mask)
+
+            if self.normalize:
+                x = self.layer_norm(x)
+
+            return x, encoder_padding_mask
+
+        if context_tokens is not None and context_lengths is not None:
+            if os.environ.get('FSEQ_USE_CONTEXT_EMBEDDING') == '1':
+                #from IPython.core.debugger import Pdb; Pdb().set_trace()
+                x, encoder_padding_mask = context_embedding(mode='linear')
+                #x, encoder_padding_mask = context_embedding(mode='source_target')
+            elif os.environ.get('FSEQ_USE_MULTI_ENCODER') == '1':
+                #from IPython.core.debugger import Pdb; Pdb().set_trace()
+                x, encoder_padding_mask = multi_encoder(mode='voita')
+            else:
+                raise NotImplementedError
+        else:
+            x, encoder_padding_mask = traditional()
+            
 
         return {
             'encoder_out': x,  # T x B x C
@@ -442,8 +639,6 @@ class TransformerDecoder(FairseqIncrementalDecoder):
         x = x.transpose(0, 1)
         attn = None
 
-        inner_states = [x]
-
         # decoder layers
         for layer in self.layers:
             x, attn = layer(
@@ -451,9 +646,7 @@ class TransformerDecoder(FairseqIncrementalDecoder):
                 encoder_out['encoder_out'] if encoder_out is not None else None,
                 encoder_out['encoder_padding_mask'] if encoder_out is not None else None,
                 incremental_state,
-                self_attn_mask=self.buffered_future_mask(x) if incremental_state is None else None,
             )
-            inner_states.append(x)
 
         if self.normalize:
             x = self.layer_norm(x)
@@ -471,21 +664,13 @@ class TransformerDecoder(FairseqIncrementalDecoder):
             else:
                 x = F.linear(x, self.embed_out)
 
-        return x, {'attn': attn, 'inner_states': inner_states}
+        return x, attn
 
     def max_positions(self):
         """Maximum output length supported by the decoder."""
         if self.embed_positions is None:
             return self.max_target_positions
         return min(self.max_target_positions, self.embed_positions.max_positions())
-
-    def buffered_future_mask(self, tensor):
-        dim = tensor.size(0)
-        if not hasattr(self, '_future_mask') or self._future_mask is None or self._future_mask.device != tensor.device:
-            self._future_mask = torch.triu(utils.fill_with_neg_inf(tensor.new(dim, dim)), 1)
-        if self._future_mask.size(0) < dim:
-            self._future_mask = torch.triu(utils.fill_with_neg_inf(self._future_mask.resize_(dim, dim)), 1)
-        return self._future_mask[:dim, :dim]
 
     def upgrade_state_dict(self, state_dict):
         """Upgrade a (possibly old) state dict for new versions of fairseq."""
@@ -580,6 +765,34 @@ class TransformerEncoderLayer(nn.Module):
         else:
             return x
 
+    def source_target_forward(self, x, encoder_padding_mask, q):
+        """
+        Args:
+            x (Tensor): input to the layer of shape `(seq_len, batch, embed_dim)`
+            encoder_padding_mask (ByteTensor): binary ByteTensor of shape
+                `(batch, src_len)` where padding elements are indicated by ``1``.
+
+        Returns:
+            encoded output of shape `(batch, src_len, embed_dim)`
+        """
+        #from IPython.core.debugger import Pdb; Pdb().set_trace()
+        residual = x
+        x = self.maybe_layer_norm(0, x, before=True)
+        q = self.maybe_layer_norm(0, q, before=True)
+        x, _ = self.self_attn(query=q, key=x, value=x, key_padding_mask=encoder_padding_mask)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = residual + x
+        x = self.maybe_layer_norm(0, x, after=True)
+
+        residual = x
+        x = self.maybe_layer_norm(1, x, before=True)
+        x = F.relu(self.fc1(x))
+        x = F.dropout(x, p=self.relu_dropout, training=self.training)
+        x = self.fc2(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+        x = residual + x
+        x = self.maybe_layer_norm(1, x, after=True)
+        return x
 
 class TransformerDecoderLayer(nn.Module):
     """Decoder layer block.
@@ -627,14 +840,7 @@ class TransformerDecoderLayer(nn.Module):
         self.final_layer_norm = LayerNorm(self.embed_dim)
         self.need_attn = True
 
-        self.onnx_trace = False
-
-    def prepare_for_onnx_export_(self):
-        self.onnx_trace = True
-
-    def forward(self, x, encoder_out, encoder_padding_mask, incremental_state,
-                prev_self_attn_state=None, prev_attn_state=None, self_attn_mask=None,
-                self_attn_padding_mask=None):
+    def forward(self, x, encoder_out, encoder_padding_mask, incremental_state):
         """
         Args:
             x (Tensor): input to the layer of shape `(seq_len, batch, embed_dim)`
@@ -646,20 +852,13 @@ class TransformerDecoderLayer(nn.Module):
         """
         residual = x
         x = self.maybe_layer_norm(self.self_attn_layer_norm, x, before=True)
-        if prev_self_attn_state is not None:
-            if incremental_state is None:
-                incremental_state = {}
-            prev_key, prev_value = prev_self_attn_state
-            saved_state = {"prev_key": prev_key, "prev_value": prev_value}
-            self.self_attn._set_input_buffer(incremental_state, saved_state)
         x, _ = self.self_attn(
             query=x,
             key=x,
             value=x,
-            key_padding_mask=self_attn_padding_mask,
+            mask_future_timesteps=True,
             incremental_state=incremental_state,
             need_weights=False,
-            attn_mask=self_attn_mask,
         )
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = residual + x
@@ -669,12 +868,6 @@ class TransformerDecoderLayer(nn.Module):
         if self.encoder_attn is not None:
             residual = x
             x = self.maybe_layer_norm(self.encoder_attn_layer_norm, x, before=True)
-            if prev_attn_state is not None:
-                if incremental_state is None:
-                    incremental_state = {}
-                prev_key, prev_value = prev_attn_state
-                saved_state = {"prev_key": prev_key, "prev_value": prev_value}
-                self.encoder_attn._set_input_buffer(incremental_state, saved_state)
             x, attn = self.encoder_attn(
                 query=x,
                 key=encoder_out,
@@ -696,10 +889,6 @@ class TransformerDecoderLayer(nn.Module):
         x = F.dropout(x, p=self.dropout, training=self.training)
         x = residual + x
         x = self.maybe_layer_norm(self.final_layer_norm, x, after=True)
-        if self.onnx_trace:
-            saved_state = self.self_attn._get_input_buffer(incremental_state)
-            self_attn_state = saved_state["prev_key"], saved_state["prev_value"]
-            return x, attn, self_attn_state
         return x, attn
 
     def maybe_layer_norm(self, layer_norm, x, before=False, after=False):
@@ -764,6 +953,7 @@ def base_lm_architecture(args):
     # The model training is not stable without this
     args.decoder_normalize_before = True
 
+
 @register_model_architecture('transformer_lm', 'transformer_lm_big')
 def transformer_lm_big(args):
     args.decoder_embed_dim = getattr(args, 'decoder_embed_dim', 1024)
@@ -775,7 +965,7 @@ def transformer_lm_big(args):
 @register_model_architecture('transformer_lm', 'transformer_lm_wiki103')
 def transformer_lm_wiki103(args):
     args.dropout = getattr(args, 'dropout', 0.3)
-    transformer_lm_big(args)
+    base_lm_architecture(args)
 
 
 @register_model_architecture('transformer_lm', 'transformer_lm_gbw')

@@ -5,6 +5,8 @@
 # the root directory of this source tree. An additional grant of patent rights
 # can be found in the PATENTS file in the same directory.
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -65,9 +67,6 @@ class BaseFairseqModel(nn.Module):
 
     def upgrade_state_dict(self, state_dict):
         """Upgrade old state dicts to work with newer code."""
-        self.upgrade_state_dict_named(state_dict, '')
-
-    def upgrade_state_dict_named(self, state_dict, name):
         assert state_dict is not None
 
         def do_upgrade(m, prefix):
@@ -82,7 +81,7 @@ class BaseFairseqModel(nn.Module):
                     c.upgrade_state_dict(state_dict)
                 do_upgrade(c, name)
 
-        do_upgrade(self, name)
+        do_upgrade(self, '')
 
     def make_generation_fast_(self, **kwargs):
         """Optimize model for faster generation."""
@@ -137,8 +136,15 @@ class FairseqModel(BaseFairseqModel):
         self.decoder = decoder
         assert isinstance(self.encoder, FairseqEncoder)
         assert isinstance(self.decoder, FairseqDecoder)
+        """
+        if os.environ.get('MULTI_ENCODER') == 'voita':
+            dim = 512
+            self.linear_multi_encoder = nn.Linear(dim * 2, dim)
+        """
 
-    def forward(self, src_tokens, src_lengths, prev_output_tokens):
+    def forward(self, src_tokens, src_lengths, prev_output_tokens,
+                context_tokens=None, context_lengths=None):
+                #**keyword_arguments):
         """
         Run the forward pass for an encoder-decoder model.
 
@@ -159,7 +165,26 @@ class FairseqModel(BaseFairseqModel):
         Returns:
             the decoder's output, typically of shape `(batch, tgt_len, vocab)`
         """
-        encoder_out = self.encoder(src_tokens, src_lengths)
+        #from IPython.core.debugger import Pdb; Pdb().set_trace()
+        context_flag = False
+        if context_tokens is not None and context_lengths is not None:
+            context_flag = True
+            if os.environ.get('MULTI_ENCODER') == 'voita':
+               context_flag = False
+
+        if context_flag:
+            encoder_out = self.encoder(src_tokens, src_lengths,
+                                       context_tokens, context_lengths)
+        elif os.environ.get('MULTI_ENCODER') == 'voita':
+            raise "鋭意実装中"
+            """
+            context_out = self.encoder(context_tokens, context_lengths)
+            encoder_out = self.encoder(src_tokens, src_lengths)
+            encoder_out = self.linear_multi_encoder(
+                              torch.cat([]))
+            """
+        else:
+            encoder_out = self.encoder(src_tokens, src_lengths)
         decoder_out = self.decoder(prev_output_tokens, encoder_out)
         return decoder_out
 
@@ -199,7 +224,3 @@ class FairseqLanguageModel(BaseFairseqModel):
     def max_positions(self):
         """Maximum length supported by the model."""
         return self.decoder.max_positions()
-
-    @property
-    def supported_targets(self):
-        return {'future'}
